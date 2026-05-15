@@ -1,4 +1,4 @@
-# NexChat Socket Server
+# sNexChat Socket Server
 
 Standalone Socket.IO + WebRTC signalling server for NexChat. Deploy this as a long-running Node service on a host that supports persistent WebSocket connections (Vercel cannot — that's why this is split out).
 
