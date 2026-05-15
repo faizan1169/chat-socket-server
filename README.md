@@ -1,42 +1,8 @@
-# NexChat Socket Server
+# sNexChat Socket Server
 
 Standalone Socket.IO + WebRTC signalling server for NexChat. Deploy this as a long-running Node service on a host that supports persistent WebSocket connections (Vercel cannot — that's why this is split out).
 
 Recommended hosts: **Railway**, **Fly.io**, **Render**, **DigitalOcean App Platform**.
-
----
-
-## What this service does
-
-- Accepts authenticated Socket.IO connections from web + mobile clients
-- Brokers all real-time chat events (messages, typing, read receipts, pin, edit, delete, clear)
-- Brokers all WebRTC signalling (offer / answer / ICE candidates / call lifecycle)
-- Persists messages and call records to Supabase
-- Exposes an authenticated `/internal/*` HTTP bridge that lets the Next.js API routes broadcast events (admin send-as-admin, force-logout, block-status)
-
----
-
-## Local development
-
-```bash
-cd socket-server
-cp .env.example .env
-# Fill in JWT_SECRET, SUPABASE_*, INTERNAL_API_SECRET (must match the Next app)
-npm install
-npm run dev          # runs on http://localhost:3001
-```
-
-In a second terminal, run the Next app pointing at the local socket server:
-
-```bash
-# In nextjs-webrtc-app/.env.local
-NEXT_PUBLIC_SOCKET_URL=http://localhost:3001
-SOCKET_SERVER_INTERNAL_URL=http://localhost:3001
-INTERNAL_API_SECRET=<same value as socket-server/.env>
-```
-
-> **Single-process dev (no separate socket server)**
-> If you don't set `NEXT_PUBLIC_SOCKET_URL`, the legacy `pages/api/socket.ts` route in the Next app still serves sockets for `next dev`. Useful for quick local work, but does not work on Vercel.
 
 ---
 
@@ -45,7 +11,7 @@ INTERNAL_API_SECRET=<same value as socket-server/.env>
 1. **Create a new Railway service** from this monorepo.
 2. **Set the Root Directory** in service settings to `socket-server`.
 3. **Set environment variables** (see `.env.example`):
-   - `JWT_SECRET` — must match the Next.js app exactly
+   - `JWT_SECRET` — must match the Next.js app
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `INTERNAL_API_SECRET` — generate a long random string, MUST match the Next.js app
