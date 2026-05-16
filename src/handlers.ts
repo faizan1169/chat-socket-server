@@ -195,13 +195,27 @@ async function buildConversationPayload(conversationId: string) {
 
   const { data: partRows } = await supabaseAdmin
     .from('conversation_participants')
-    .select('user_id')
+    .select('user_id, is_admin, joined_at, left_at')
     .eq('conversation_id', conversationId);
-  const userIds = (partRows || []).map((p) => p.user_id);
+  const rows = partRows || [];
+  const userIds = rows.map((p: any) => p.user_id);
   const { data: usersData } = userIds.length
     ? await supabaseAdmin.from('users').select('id, username, avatar').in('id', userIds)
     : { data: [] as Array<{ id: string; username: string; avatar: string | null }> };
-  const participants = (usersData || []).map((u) => ({ user: u }));
+  const usersById = new Map<string, { id: string; username: string; avatar: string | null }>();
+  (usersData || []).forEach((u: any) => usersById.set(u.id, u));
+  const participants = rows
+    .map((r: any) => {
+      const u = usersById.get(r.user_id);
+      if (!u) return null;
+      return {
+        user: u,
+        isAdmin: !!r.is_admin,
+        joinedAt: r.joined_at,
+        leftAt: r.left_at ?? null,
+      };
+    })
+    .filter((x): x is { user: any; isAdmin: boolean; joinedAt: any; leftAt: any } => !!x);
 
   const { data: lastMsg } = await supabaseAdmin
     .from('messages')
@@ -217,6 +231,10 @@ async function buildConversationPayload(conversationId: string) {
     isGroup: conv.is_group,
     isAdminThread: !!conv.is_admin_thread,
     adminId: conv.admin_id || null,
+    avatar: conv.avatar || null,
+    about: conv.about || null,
+    onlyAdminCanSend: !!conv.only_admin_can_send,
+    createdBy: conv.created_by || null,
     createdAt: conv.created_at,
     updatedAt: conv.updated_at,
     participants,
@@ -318,8 +336,8 @@ export function registerHandlers(io: ServerIO) {
         audioDuration,
       } = data || {};
 
-      if (!to || !from) {
-        if (callback) callback({ status: 'error', message: 'Missing recipient or sender' });
+      if (!from) {
+        if (callback) callback({ status: 'error', message: 'Missing sender' });
         return;
       }
       if (!isSenderValid(socket, from)) {
@@ -331,16 +349,39 @@ export function registerHandlers(io: ServerIO) {
         return;
       }
 
-      const cleanTo = String(to).trim();
       const cleanFrom = String(from).trim();
+      const rawTo = typeof to === 'string' ? to.trim() : '';
+      const isGroupPlaceholder = rawTo.startsWith('__group:');
+      const cleanTo = isGroupPlaceholder ? '' : rawTo;
+      const clientConvIdRaw: string | undefined =
+        (data as any).conversation_id || (data as any).conversationId;
+      if (!cleanTo && !clientConvIdRaw) {
+        if (callback) callback({ status: 'error', message: 'Missing recipient or conversation' });
+        return;
+      }
 
       try {
-        const [{ data: fromUser }, { data: toUser }] = await Promise.all([
-          supabaseAdmin.from('users').select('id').eq('username', cleanFrom).single(),
-          supabaseAdmin.from('users').select('id').eq('username', cleanTo).single(),
-        ]);
+        const fromUserRes = await supabaseAdmin
+          .from('users')
+          .select('id')
+          .eq('username', cleanFrom)
+          .single();
+        const fromUser = fromUserRes.data;
+        let toUser: { id: string } | null = null;
+        if (cleanTo) {
+          const toUserRes = await supabaseAdmin
+            .from('users')
+            .select('id')
+            .eq('username', cleanTo)
+            .single();
+          toUser = toUserRes.data;
+        }
 
-        if (!fromUser || !toUser) {
+        if (!fromUser) {
+          if (callback) callback({ status: 'error', message: 'User not found' });
+          return;
+        }
+        if (cleanTo && !toUser) {
           if (callback) callback({ status: 'error', message: 'User not found' });
           return;
         }
@@ -349,14 +390,14 @@ export function registerHandlers(io: ServerIO) {
           return;
         }
 
-        const clientConvId: string | undefined =
-          (data as any).conversation_id || (data as any).conversationId;
+        const clientConvId: string | undefined = clientConvIdRaw;
         let convId: string;
         let createdNew = false;
+        let convRow: { id: string; is_group: boolean; only_admin_can_send: boolean | null } | null = null;
         if (clientConvId) {
           const { data: existing } = await supabaseAdmin
             .from('conversations')
-            .select('id')
+            .select('id, is_group, only_admin_can_send')
             .eq('id', clientConvId)
             .maybeSingle();
           if (!existing) {
@@ -368,7 +409,12 @@ export function registerHandlers(io: ServerIO) {
             return;
           }
           convId = existing.id as string;
+          convRow = existing as any;
         } else {
+          if (!toUser) {
+            if (callback) callback({ status: 'error', message: 'Conversation required' });
+            return;
+          }
           const convResult = await getOrCreateConversation(fromUser.id, toUser.id);
           if (!convResult) {
             if (callback) callback({ status: 'error', message: 'Failed to create conversation' });
@@ -376,6 +422,19 @@ export function registerHandlers(io: ServerIO) {
           }
           convId = convResult.id;
           createdNew = convResult.wasCreated;
+        }
+
+        if (convRow?.is_group && convRow.only_admin_can_send) {
+          const { data: senderMember } = await supabaseAdmin
+            .from('conversation_participants')
+            .select('is_admin, left_at')
+            .eq('conversation_id', convId)
+            .eq('user_id', fromUser.id)
+            .maybeSingle();
+          if (!senderMember || senderMember.left_at || !senderMember.is_admin) {
+            if (callback) callback({ status: 'error', message: 'Only admins can send messages in this group' });
+            return;
+          }
         }
 
         await supabaseAdmin.from('messages').upsert(
@@ -403,26 +462,42 @@ export function registerHandlers(io: ServerIO) {
 
         const enriched = { ...data, conversation_id: convId, conversationId: convId };
 
+        const { data: convParticipants } = await supabaseAdmin
+          .from('conversation_participants')
+          .select('user_id, left_at, users:users(id, username)')
+          .eq('conversation_id', convId);
+        const activeUsernames = (convParticipants || [])
+          .filter((p: any) => !p.left_at && p.users?.username)
+          .map((p: any) => p.users.username as string);
+
         if (createdNew) {
           const convPayload = await buildConversationPayload(convId);
           if (convPayload) {
-            io.to(USER_ROOM(cleanTo)).emit('new-conversation', convPayload);
-            if (cleanFrom !== cleanTo) {
-              io.to(USER_ROOM(cleanFrom)).emit('new-conversation', convPayload);
-            }
+            const recipients = activeUsernames.length
+              ? activeUsernames
+              : Array.from(new Set([cleanTo, cleanFrom]));
+            recipients.forEach((uname) => {
+              io.to(USER_ROOM(uname)).emit('new-conversation', convPayload);
+            });
           }
         }
 
-        const recipientOnline = isUserConnected(cleanTo);
+        const recipientOnline = cleanTo ? isUserConnected(cleanTo) : false;
 
-        if (recipientOnline) {
-          io.to(USER_ROOM(cleanTo)).emit('receive-message', enriched);
-        }
-        if (cleanFrom !== cleanTo) {
-          io.to(USER_ROOM(cleanFrom)).emit('receive-message', enriched);
+        if (convRow?.is_group) {
+          activeUsernames.forEach((uname) => {
+            io.to(USER_ROOM(uname)).emit('receive-message', enriched);
+          });
+        } else {
+          if (recipientOnline) {
+            io.to(USER_ROOM(cleanTo)).emit('receive-message', enriched);
+          }
+          if (cleanFrom !== cleanTo) {
+            io.to(USER_ROOM(cleanFrom)).emit('receive-message', enriched);
+          }
         }
 
-        if (!recipientOnline && cleanFrom !== cleanTo) {
+        if (!convRow?.is_group && toUser && !recipientOnline && cleanFrom !== cleanTo) {
           void pushToUser(toUser.id, {
             title: cleanFrom,
             body: previewForMessage(data),
