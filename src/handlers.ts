@@ -252,9 +252,6 @@ async function buildConversationPayload(conversationId: string) {
 }
 
 export function registerHandlers(io: ServerIO) {
-  // Authenticate every socket connection from the access-token cookie /
-  // Authorization header. Reject the handshake if the token is missing,
-  // expired, or the user is disabled.
   io.use(async (socket, next) => {
     try {
       const auth = await authenticateSocket(socket);
@@ -276,8 +273,6 @@ export function registerHandlers(io: ServerIO) {
     }
   });
 
-  // Reject events that try to spoof the sender. The socket's identity comes
-  // from the verified JWT, not from the client payload.
   const isSenderValid = (socket: AppSocket, claimedFrom?: unknown): boolean => {
     if (!socket.data.auth) return false;
     if (typeof claimedFrom !== 'string') return true;
@@ -291,8 +286,6 @@ export function registerHandlers(io: ServerIO) {
     const socket = rawSocket as AppSocket;
     const auth = socket.data.auth;
 
-    // Auto-join the per-user room. Multi-tab/multi-device users get one
-    // logical destination, no manual socket-id bookkeeping required.
     socket.join(USER_ROOM(auth.username));
     userOnline(auth.username);
     io.emit('joined', onlineMapForClient());
@@ -564,7 +557,6 @@ export function registerHandlers(io: ServerIO) {
       }
     });
 
-    /* ─── WebRTC signalling ─────────────────────────────────────────── */
     socket.on('offer', (payload) => {
       if (!limit(socket, 'offer', 30, 10_000)) return;
       if (!isSenderValid(socket, payload?.from) || !payload?.to) return;
