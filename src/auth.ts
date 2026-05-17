@@ -9,7 +9,6 @@ export interface SocketAuth {
   username: string;
   role: 'user' | 'admin';
 }
-
 function tokenFromHandshake(socket: Socket): string | null {
   const headerAuth = socket.handshake.headers.authorization;
   if (typeof headerAuth === 'string' && headerAuth.startsWith('Bearer ')) {
