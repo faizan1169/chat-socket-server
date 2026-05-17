@@ -88,14 +88,91 @@ function buildCallPreview(callType: string, callStatus: string, durationSec: num
   return `${kind === 'video' ? 'Video' : 'Voice'} call`;
 }
 
+async function usernameForId(userId: string): Promise<string | null> {
+  const { data } = await supabaseAdmin
+    .from('users')
+    .select('username')
+    .eq('id', userId)
+    .maybeSingle();
+  return (data?.username as string) || null;
+}
+
+async function activeGroupUsernames(conversationId: string): Promise<string[]> {
+  const { data: parts } = await supabaseAdmin
+    .from('conversation_participants')
+    .select('left_at, users:users(username)')
+    .eq('conversation_id', conversationId);
+  return (parts || [])
+    .filter((p: any) => !p.left_at && p.users?.username)
+    .map((p: any) => p.users.username as string);
+}
+
+async function conversationIsGroup(conversationId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin
+    .from('conversations')
+    .select('is_group')
+    .eq('id', conversationId)
+    .maybeSingle();
+  return !!data?.is_group;
+}
+
+async function computeAndApplyAggregate(
+  messageId: string,
+): Promise<{ status: 'sent' | 'delivered' | 'read'; changed: boolean } | null> {
+  const { data: msg } = await supabaseAdmin
+    .from('messages')
+    .select('id, conversation_id, sender_id, status, timestamp')
+    .eq('id', messageId)
+    .maybeSingle();
+  if (!msg) return null;
+
+  const { data: parts } = await supabaseAdmin
+    .from('conversation_participants')
+    .select('user_id, left_at, joined_at')
+    .eq('conversation_id', msg.conversation_id);
+
+  const sentAt = msg.timestamp ? new Date(msg.timestamp).getTime() : 0;
+  const recipients = (parts || []).filter(
+    (p: any) =>
+      p.user_id !== msg.sender_id &&
+      (!p.left_at || new Date(p.left_at).getTime() > sentAt) &&
+      (!p.joined_at || new Date(p.joined_at).getTime() <= sentAt),
+  );
+  if (!recipients.length) {
+    return { status: (msg.status as any) || 'sent', changed: false };
+  }
+  const recipientIds = recipients.map((r: any) => r.user_id);
+  const { data: receipts } = await supabaseAdmin
+    .from('message_receipts')
+    .select('user_id, delivered_at, read_at')
+    .eq('message_id', messageId)
+    .in('user_id', recipientIds);
+  const byUser = new Map<string, { delivered_at: string | null; read_at: string | null }>();
+  (receipts || []).forEach((r: any) =>
+    byUser.set(r.user_id, { delivered_at: r.delivered_at, read_at: r.read_at }),
+  );
+  const allDelivered = recipientIds.every((uid: string) => !!byUser.get(uid)?.delivered_at);
+  const allRead = recipientIds.every((uid: string) => !!byUser.get(uid)?.read_at);
+  const next: 'sent' | 'delivered' | 'read' = allRead
+    ? 'read'
+    : allDelivered
+      ? 'delivered'
+      : 'sent';
+  if (next === msg.status) return { status: next, changed: false };
+  await supabaseAdmin.from('messages').update({ status: next }).eq('id', messageId);
+  return { status: next, changed: true };
+}
+
 async function isParticipant(userId: string, conversationId: string): Promise<boolean> {
   const { data } = await supabaseAdmin
     .from('conversation_participants')
-    .select('user_id')
+    .select('user_id, left_at')
     .eq('conversation_id', conversationId)
     .eq('user_id', userId)
     .maybeSingle();
-  return !!data;
+  if (!data) return false;
+  if (data.left_at) return false;
+  return true;
 }
 
 async function getOrCreateConversation(
@@ -158,8 +235,6 @@ async function getOrCreateConversation(
       .map(([id]) => id);
 
     if (sharedIds.length) {
-      // Only reuse a regular (user-mode) thread here. Admin-mode threads are
-      // owned by the admin send-as-admin flow and stay separate.
       const { data: userThread } = await supabaseAdmin
         .from('conversations')
         .select('id')
@@ -234,6 +309,7 @@ async function buildConversationPayload(conversationId: string) {
     avatar: conv.avatar || null,
     about: conv.about || null,
     onlyAdminCanSend: !!conv.only_admin_can_send,
+    onlyAdminCanAddMembers: !!conv.only_admin_can_add_members,
     createdBy: conv.created_by || null,
     createdAt: conv.created_at,
     updatedAt: conv.updated_at,
@@ -536,7 +612,7 @@ export function registerHandlers(io: ServerIO) {
       try {
         const { data: msg } = await supabaseAdmin
           .from('messages')
-          .select('timestamp, sender_id')
+          .select('timestamp, sender_id, conversation_id')
           .eq('id', id)
           .single();
         if (!msg) return;
@@ -551,7 +627,15 @@ export function registerHandlers(io: ServerIO) {
           .update({ is_deleted: true, content: '', audio_url: null })
           .eq('id', id);
 
-        if (typeof to === 'string') io.to(USER_ROOM(to)).emit('delete-message', { id });
+        if (await conversationIsGroup(msg.conversation_id)) {
+          const targets = await activeGroupUsernames(msg.conversation_id);
+          targets.forEach((uname) =>
+            io.to(USER_ROOM(uname)).emit('delete-message', { id, conversationId: msg.conversation_id }),
+          );
+        } else if (typeof to === 'string') {
+          io.to(USER_ROOM(to)).emit('delete-message', { id });
+          io.to(USER_ROOM(auth.username)).emit('delete-message', { id });
+        }
       } catch (error) {
         console.error('[socket] delete-message error:', error);
       }
@@ -661,13 +745,49 @@ export function registerHandlers(io: ServerIO) {
       if (payload?.to) io.to(USER_ROOM(payload.to)).emit('mute-status', payload);
     });
 
-    socket.on('typing', (payload) => {
+    socket.on('typing', async (payload) => {
       if (!limit(socket, 'typing', 60, 10_000)) return;
-      if (!payload?.to || !payload?.from) return;
+      if (!payload?.from) return;
       if (!isSenderValid(socket, payload.from)) return;
-      io.to(USER_ROOM(payload.to)).emit('typing', {
+
+      const convIdRaw = payload.conversationId;
+      const targetRaw = typeof payload.to === 'string' ? payload.to.trim() : '';
+      const isGroupTarget = targetRaw.startsWith('__group:');
+      const convId = typeof convIdRaw === 'string' && convIdRaw ? convIdRaw : null;
+
+      if (convId && (isGroupTarget || !targetRaw)) {
+        try {
+          const { data: conv } = await supabaseAdmin
+            .from('conversations')
+            .select('is_group')
+            .eq('id', convId)
+            .maybeSingle();
+          if (conv?.is_group) {
+            const { data: parts } = await supabaseAdmin
+              .from('conversation_participants')
+              .select('left_at, users:users(username)')
+              .eq('conversation_id', convId);
+            const targets = (parts || [])
+              .filter((p: any) => !p.left_at && p.users?.username && p.users.username !== payload.from)
+              .map((p: any) => p.users.username as string);
+            targets.forEach((uname) => {
+              io.to(USER_ROOM(uname)).emit('typing', {
+                from: payload.from,
+                conversationId: convId,
+                isTyping: !!payload.isTyping,
+              });
+            });
+            return;
+          }
+        } catch (e) {
+          console.error('[socket] typing fanout failed:', e);
+        }
+      }
+
+      if (!targetRaw) return;
+      io.to(USER_ROOM(targetRaw)).emit('typing', {
         from: payload.from,
-        conversationId: payload.conversationId,
+        conversationId: convId,
         isTyping: !!payload.isTyping,
       });
     });
@@ -776,9 +896,33 @@ export function registerHandlers(io: ServerIO) {
         if (msg.sender_id === auth.userId) return;
         if (!(await isParticipant(auth.userId, msg.conversation_id))) return;
 
-        await supabaseAdmin.from('messages').update({ status: 'delivered' }).eq('id', messageId);
-        if (typeof to === 'string') {
-          io.to(USER_ROOM(to)).emit('message-status-update', { messageId, status: 'delivered' });
+        const { data: conv } = await supabaseAdmin
+          .from('conversations')
+          .select('is_group')
+          .eq('id', msg.conversation_id)
+          .maybeSingle();
+
+        if (conv?.is_group) {
+          const now = new Date().toISOString();
+          await supabaseAdmin.from('message_receipts').upsert(
+            { message_id: messageId, user_id: auth.userId, delivered_at: now },
+            { onConflict: 'message_id,user_id', ignoreDuplicates: false },
+          );
+          const next = await computeAndApplyAggregate(messageId);
+          if (next?.changed) {
+            const senderUsername = await usernameForId(msg.sender_id);
+            if (senderUsername) {
+              io.to(USER_ROOM(senderUsername)).emit('message-status-update', {
+                messageId,
+                status: next.status,
+              });
+            }
+          }
+        } else {
+          await supabaseAdmin.from('messages').update({ status: 'delivered' }).eq('id', messageId);
+          if (typeof to === 'string') {
+            io.to(USER_ROOM(to)).emit('message-status-update', { messageId, status: 'delivered' });
+          }
         }
       } catch (e) {
         console.error('[socket] mark-delivered failed:', e);
@@ -797,9 +941,33 @@ export function registerHandlers(io: ServerIO) {
         if (msg.sender_id === auth.userId) return;
         if (!(await isParticipant(auth.userId, msg.conversation_id))) return;
 
-        await supabaseAdmin.from('messages').update({ status: 'read' }).eq('id', messageId);
-        if (typeof to === 'string') {
-          io.to(USER_ROOM(to)).emit('message-status-update', { messageId, status: 'read' });
+        const { data: conv } = await supabaseAdmin
+          .from('conversations')
+          .select('is_group')
+          .eq('id', msg.conversation_id)
+          .maybeSingle();
+
+        if (conv?.is_group) {
+          const now = new Date().toISOString();
+          await supabaseAdmin.from('message_receipts').upsert(
+            { message_id: messageId, user_id: auth.userId, delivered_at: now, read_at: now },
+            { onConflict: 'message_id,user_id', ignoreDuplicates: false },
+          );
+          const next = await computeAndApplyAggregate(messageId);
+          if (next?.changed) {
+            const senderUsername = await usernameForId(msg.sender_id);
+            if (senderUsername) {
+              io.to(USER_ROOM(senderUsername)).emit('message-status-update', {
+                messageId,
+                status: next.status,
+              });
+            }
+          }
+        } else {
+          await supabaseAdmin.from('messages').update({ status: 'read' }).eq('id', messageId);
+          if (typeof to === 'string') {
+            io.to(USER_ROOM(to)).emit('message-status-update', { messageId, status: 'read' });
+          }
         }
       } catch (e) {
         console.error('[socket] mark-read failed:', e);
@@ -809,18 +977,30 @@ export function registerHandlers(io: ServerIO) {
     socket.on('edit-message', async ({ id, to, message }) => {
       if (!limit(socket, 'edit-message', 30, 10_000)) return;
       try {
-        if (!id || !to) return;
+        if (!id) return;
         if (typeof message === 'string' && message.length > MAX_MESSAGE_LENGTH) return;
 
         const { data: msg } = await supabaseAdmin
           .from('messages')
-          .select('sender_id')
+          .select('sender_id, conversation_id')
           .eq('id', id)
           .maybeSingle();
         if (!msg) return;
         if (msg.sender_id !== auth.userId && auth.role !== 'admin') return;
 
-        io.to(USER_ROOM(String(to))).emit('message-edited', { id, message });
+        if (await conversationIsGroup(msg.conversation_id)) {
+          const targets = await activeGroupUsernames(msg.conversation_id);
+          targets.forEach((uname) =>
+            io.to(USER_ROOM(uname)).emit('message-edited', {
+              id,
+              message,
+              conversationId: msg.conversation_id,
+            }),
+          );
+        } else if (typeof to === 'string' && to) {
+          io.to(USER_ROOM(String(to))).emit('message-edited', { id, message });
+          io.to(USER_ROOM(auth.username)).emit('message-edited', { id, message });
+        }
       } catch (e) {
         console.error('[socket] edit-message failed:', e);
       }
@@ -838,8 +1018,19 @@ export function registerHandlers(io: ServerIO) {
         if (auth.role !== 'admin' && !(await isParticipant(auth.userId, msg.conversation_id))) return;
 
         await supabaseAdmin.from('messages').update({ is_pinned: !!isPinned }).eq('id', id);
-        if (typeof to === 'string') {
+
+        if (await conversationIsGroup(msg.conversation_id)) {
+          const targets = await activeGroupUsernames(msg.conversation_id);
+          targets.forEach((uname) =>
+            io.to(USER_ROOM(uname)).emit('pin-message', {
+              id,
+              isPinned,
+              conversationId: msg.conversation_id,
+            }),
+          );
+        } else if (typeof to === 'string') {
           io.to(USER_ROOM(to)).emit('pin-message', { id, isPinned });
+          io.to(USER_ROOM(auth.username)).emit('pin-message', { id, isPinned });
         }
       } catch (e) {
         console.error('[socket] pin-message failed:', e);
@@ -882,33 +1073,33 @@ export function registerHandlers(io: ServerIO) {
 
         socket.emit('message-reacted', { id, reactions: current });
 
-        const cleanTo = typeof to === 'string' ? to.trim() : '';
-        if (cleanTo) {
-          const messagePreview = previewForStoredMessage(msg);
-          const recipientIsMessageOwner =
-            !!msg.sender_id && msg.sender_id !== auth.userId;
-          io.to(USER_ROOM(cleanTo)).emit('message-reacted', {
-            id,
-            reactions: current,
-            from: auth.username,
-            emoji,
-            removed,
-            conversationId: msg.conversation_id,
-            messagePreview,
-            ownerIsRecipient: recipientIsMessageOwner,
-          });
+        const messagePreview = previewForStoredMessage(msg);
+        const recipientIsMessageOwner =
+          !!msg.sender_id && msg.sender_id !== auth.userId;
+        const broadcast = {
+          id,
+          reactions: current,
+          from: auth.username,
+          emoji,
+          removed,
+          conversationId: msg.conversation_id,
+          messagePreview,
+          ownerIsRecipient: recipientIsMessageOwner,
+        };
 
-          if (!removed && recipientIsMessageOwner && !isUserConnected(cleanTo)) {
-            const { data: toUser } = await supabaseAdmin
-              .from('users')
-              .select('id')
-              .eq('username', cleanTo)
-              .maybeSingle();
-            if (toUser?.id) {
+        if (await conversationIsGroup(msg.conversation_id)) {
+          const targets = await activeGroupUsernames(msg.conversation_id);
+          targets
+            .filter((uname) => uname !== auth.username)
+            .forEach((uname) => io.to(USER_ROOM(uname)).emit('message-reacted', broadcast));
+
+          if (!removed && recipientIsMessageOwner) {
+            const ownerUsername = await usernameForId(msg.sender_id);
+            if (ownerUsername && !isUserConnected(ownerUsername)) {
               const body = messagePreview
                 ? `Reacted ${emoji} to: ${messagePreview}`
                 : `Reacted ${emoji} to your message`;
-              void pushToUser(toUser.id, {
+              void pushToUser(msg.sender_id, {
                 title: auth.username,
                 body,
                 sound: 'default',
@@ -922,6 +1113,38 @@ export function registerHandlers(io: ServerIO) {
                   from: auth.username,
                 },
               });
+            }
+          }
+        } else {
+          const cleanTo = typeof to === 'string' ? to.trim() : '';
+          if (cleanTo) {
+            io.to(USER_ROOM(cleanTo)).emit('message-reacted', broadcast);
+
+            if (!removed && recipientIsMessageOwner && !isUserConnected(cleanTo)) {
+              const { data: toUser } = await supabaseAdmin
+                .from('users')
+                .select('id')
+                .eq('username', cleanTo)
+                .maybeSingle();
+              if (toUser?.id) {
+                const body = messagePreview
+                  ? `Reacted ${emoji} to: ${messagePreview}`
+                  : `Reacted ${emoji} to your message`;
+                void pushToUser(toUser.id, {
+                  title: auth.username,
+                  body,
+                  sound: 'default',
+                  channelId: 'default',
+                  priority: 'high',
+                  data: {
+                    type: 'reaction',
+                    conversationId: msg.conversation_id,
+                    messageId: id,
+                    emoji,
+                    from: auth.username,
+                  },
+                });
+              }
             }
           }
         }
@@ -960,8 +1183,22 @@ export function registerHandlers(io: ServerIO) {
 
         await supabaseAdmin.from('messages').delete().eq('conversation_id', conversationId);
 
-        if (typeof to === 'string') {
-          io.to(USER_ROOM(to)).emit('clear-all-messages', { from, to });
+        if (await conversationIsGroup(conversationId)) {
+          const targets = await activeGroupUsernames(conversationId);
+          targets.forEach((uname) =>
+            io.to(USER_ROOM(uname)).emit('clear-all-messages', {
+              from,
+              to: uname,
+              conversationId,
+            }),
+          );
+        } else if (typeof to === 'string') {
+          io.to(USER_ROOM(to)).emit('clear-all-messages', { from, to, conversationId });
+          io.to(USER_ROOM(auth.username)).emit('clear-all-messages', {
+            from,
+            to: auth.username,
+            conversationId,
+          });
         }
       } catch (e) {
         console.error('[socket] clear-all-messages error:', e);
